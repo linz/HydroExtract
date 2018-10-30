@@ -7,6 +7,7 @@ import re
 import yaml
 import ast
 import csv
+import difflib
 from lxml import etree
 from LDSAPI import StaticFetch, Authentication
 from LinzUtil import LDS
@@ -27,8 +28,10 @@ from six.moves.urllib.error import HTTPError
 with open('properties.yaml') as h: yprops = yaml.load(h)
 #Set Namespace Bundle
 NSX = yprops['namespaces']['ns2']
+#CAPSFILTER = 'Hydrographic'
+METAFILTER = ('./gmd:contact/gmd:CI_ResponsibleParty/gmd:positionName/gco:CharacterString','National Hydrographer',0.85)
 
-
+    
 class SQL3DB(object):
     
     RTBL = 'hydro'
@@ -89,6 +92,7 @@ class SQL3DB(object):
 class LDS(object):
     #{'kfile':'.apikeyHEx'}
     korb = {'kfile':'.apikeyHEx'}#{'key':KEY}
+    parser = etree.XMLParser(ns_clean=True, recover=True, encoding='utf-8')
     
     def __init__(self):
         pass
@@ -97,15 +101,14 @@ class LDS(object):
         '''Simple id extract from getcaps'''
         retry = 5
         ret = {'layer':(),'table':()}
-        parser = etree.XMLParser(ns_clean=True, recover=True, encoding='utf-8')
         while retry:
             try:
                 content = StaticFetch.get(url,korb=self.korb)
                 text = content.read()
-                tree = etree.fromstring(text, parser=parser)
+                tree = etree.fromstring(text, parser=self.parser)
                 for ft in tree.findall(FTX, namespaces=NSX):
                     #\d+ finds either v:x-NNN or layer-NNN but also table-NNN
-                    if not any([re.search('Hydrographic',t.text) for t in ft.findall(HPTH, namespaces=NSX)]):
+                    if CAPSFILTER and not any([re.search(CAPSFILTER,t.text) for t in ft.findall(HPTH, namespaces=NSX)]):
                         continue
                     match = re.search('(layer|table)-(\d+)',ft.find(NPTH, namespaces=NSX).text)
                     lort = match.group(1)
@@ -123,7 +126,7 @@ class LDS(object):
         return ret
     
     def getids(self):
-        k = Authentication.apikey(self.korb.values()['kfile'])
+        k = Authentication.apikey(self.korb['kfile'])
         cap1 = CAP.format(key=k,svc='wfs',ver=WFSv)
         cap2 = CAP.format(key=k,svc='wms',ver=WMSv)
         return self.idlist(cap1),self.idlist(cap2)
@@ -131,10 +134,22 @@ class LDS(object):
     @classmethod
     def readurl(cls,lid):
         u = MET.format(id=lid)
-        res = StaticFetch.get(u,korb=cls.korb).read().decode()
-        if re.search('<!DOCTYPE html>',res):
-            print('HTML returned for {}, probably a private layer {}'.format(lid,res[:100]))
-        return res
+        content = StaticFetch.get(u,korb=cls.korb).read().decode()
+        if re.search('<!DOCTYPE html>',content):
+            print('HTML returned for {}, probably a private layer {}'.format(lid,content[:100]))
+            return
+        if lid==50789:
+            pass
+        if METAFILTER:
+            tree = etree.fromstring(content, parser=cls.parser)
+            node = tree.find(METAFILTER[0], namespaces=NSX)
+            if node is None:
+                print ('No path to filter',METAFILTER[0])
+                return
+            elif not node.text or difflib.SequenceMatcher(None,METAFILTER[1],node.text).ratio()<METAFILTER[2]:
+                print('Can\'t match filter {}!={}'.format(METAFILTER[1],node.text))
+                return
+        return content
     
 def readfile(filename):
     with open(filename) as h:
@@ -144,6 +159,7 @@ def readfile(filename):
 def transform(ident, hydroreader, fnxsl = 's1.xsl'):
     res = None
     hydro_txt = hydroreader(ident)
+    if not hydro_txt: return
     xsl_txt = readfile(fnxsl)
     try:
         hydro = etree.XML(hydro_txt)
@@ -176,12 +192,14 @@ def parse(res):
     return colnames,colvals
 
 def main():
+    global CAPSFILTER,METAFILTER
+    if 'CAPSFILTER' not in globals(): CAPSFILTER = None
+    if 'METAFILTER' not in globals(): METAFILTER = None
     sq = SQL3DB()
     lds = LDS()
-    #for lid in [51247,51402]:
     wfsx,wmsx = lds.getids()
     for lid,_ in wfsx['layer']+wmsx['layer']:
-    #for lid in [51779,]:
+    #for lid in [50789,51247,51402,51779,]:
         print(lid)
         #res = transform(fnxsl='s6.xsl',ident=filename,readfile)
         res = transform(ident=lid,hydroreader=lds.readurl,fnxsl='s6.xsl')
