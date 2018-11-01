@@ -8,13 +8,18 @@ import yaml
 import ast
 import csv
 import difflib
+import sqlite3
+import json
 from lxml import etree
 from LDSAPI import StaticFetch, Authentication
-from LinzUtil import LDS
-import sqlite3
-#import lxml
+from six.moves.urllib.error import HTTPError
 
-MET = 'https://data.linz.govt.nz/layer/{id}/metadata/iso/xml/'
+XST = 'https://data.linz.govt.nz/layer/{id}/metadata/iso/xml/'
+
+INF = 'https://data.linz.govt.nz/services/api/v1/layers/{lid}/'
+VER = 'https://data.linz.govt.nz/services/api/v1/layers/{lid}/versions/{ver}'
+MET = 'https://data.linz.govt.nz/services/api/v1/layers/{lid}/versions/{ver}/metadata/iso/'
+
 CAP = 'http://data.linz.govt.nz/services;key={key}/{svc}?service={svc}&version={ver}&request=GetCapabilities'
 FTX = './wfs:FeatureTypeList/wfs:FeatureType'
 TPTH = "./wfs:Title"
@@ -23,14 +28,14 @@ HPTH = "./ows:Keywords/ows:Keyword"
 WFSv = '2.0.0'
 WMSv = '1.1.1'
 
-from six.moves.urllib.error import HTTPError
+
 
 with open('properties.yaml') as h: yprops = yaml.load(h)
 #Set Namespace Bundle
 NSX = yprops['namespaces']['ns2']
 #CAPSFILTER = 'Hydrographic'
-METAFILTER = ('./gmd:contact/gmd:CI_ResponsibleParty/gmd:positionName/gco:CharacterString','National Hydrographer',0.85)
-
+#METAFILTER = ('./gmd:contact/gmd:CI_ResponsibleParty/gmd:positionName/gco:CharacterString','National Hydrographer',0.85)
+GRP_FILTER = 2006
     
 class SQL3DB(object):
     
@@ -89,13 +94,38 @@ class SQL3DB(object):
         self.commit()
         self.rsql.close()
     
-class LDS(object):
+class LDSRead(object):
     #{'kfile':'.apikeyHEx'}
     korb = {'kfile':'.apikeyHEx'}#{'key':KEY}
     parser = etree.XMLParser(ns_clean=True, recover=True, encoding='utf-8')
     
     def __init__(self):
         pass
+    
+    @classmethod
+    def getInfo(cls,lid):
+        '''Get layer info page''' 
+        content = StaticFetch.get(INF.format(lid=lid),korb=cls.korb).read().decode()
+        try:
+            dic = json.loads(content)
+        except:
+            dic = ast.literal_eval(content)
+        #return a subset of the info
+        return {k: dic.get(k, None) for k in ('group', 'version', 'metadata')}
+    
+    @staticmethod
+    def drill(dic,pth):
+        '''Trace a defined dict path which may be incomplete'''
+        #print (pth,'##',dic)
+        if pth and isinstance(dic,dict) and pth[0] in dic: 
+            return LDSRead.drill(dic[pth[0]],pth[1:])
+        else: return not len(pth),dic
+    
+    @classmethod
+    def getVerURL(cls,lid): 
+        '''Get the latest metadata version number''' 
+        v = cls.getInfo(lid)
+        return v['url']
     
     def idlist(self,url):
         '''Simple id extract from getcaps'''
@@ -133,13 +163,21 @@ class LDS(object):
     
     @classmethod
     def readurl(cls,lid):
-        u = MET.format(id=lid)
-        content = StaticFetch.get(u,korb=cls.korb).read().decode()
+        #u = MET.format(id=lid)
+        info = cls.getInfo(lid)
+        yes_meta,ver_url = cls.drill(info, ('metadata','iso'))
+        if not yes_meta:
+            print('No Metadata associated with this layer',lid)
+            return
+        yes_group,grp_val = cls.drill(info,('group','id'))
+        if not yes_group or grp_val != GRP_FILTER:
+            print('Layer {} does not belong to group {}!={}'.format(lid,grp_val,GRP_FILTER))
+            return
+            
+        content = StaticFetch.get(ver_url,korb=cls.korb).read().decode()
         if re.search('<!DOCTYPE html>',content):
             print('HTML returned for {}, probably a private layer {}'.format(lid,content[:100]))
             return
-        if lid==50789:
-            pass
         if METAFILTER:
             tree = etree.fromstring(content, parser=cls.parser)
             node = tree.find(METAFILTER[0], namespaces=NSX)
@@ -171,20 +209,13 @@ def transform(ident, hydroreader, fnxsl = 's1.xsl'):
         print('FAIL',ident,e)
         raise
     return res
-
-def slowdictbuild(res):
-    kv = {}
-    for i in res.split('","'):
-        k,v = i.replace('{','').replace('}','').split('":"')
-        kv[k.lstrip('"')] = v.rstrip('",')
-    return kv
         
 def parse(res):
     '''parse the result to a dict and extract colnames and their values'''
     try:
-        dic = ast.literal_eval(res)
+        dic = json.loads(res)
     except:
-        dic = slowdictbuild(res)
+        dic = ast.literal_eval(res)
     #eval DQ escapes get deleted in processing so put SQL3 escapes in
     dic = {k:v.replace('"','""') for k,v in dic.items()}
     colnames = ','.join(dic.keys())
@@ -196,15 +227,14 @@ def main():
     if 'CAPSFILTER' not in globals(): CAPSFILTER = None
     if 'METAFILTER' not in globals(): METAFILTER = None
     sq = SQL3DB()
-    lds = LDS()
+    lds = LDSRead()
     wfsx,wmsx = lds.getids()
     for lid,_ in wfsx['layer']+wmsx['layer']:
-    #for lid in [50789,51247,51402,51779,]:
+    #for lid in [51779,50789,51247,51402,51779,]:
         print(lid)
-        #res = transform(fnxsl='s6.xsl',ident=filename,readfile)
+        #res = transform(ident=filename,hydroreader=readfile,fnxsl='s6.xsl')
         res = transform(ident=lid,hydroreader=lds.readurl,fnxsl='s6.xsl')
         if res: sq.populate(lid,*parse(str(res)))
-        #print(lid,res)
 
     sq.output()
     sq.close()
